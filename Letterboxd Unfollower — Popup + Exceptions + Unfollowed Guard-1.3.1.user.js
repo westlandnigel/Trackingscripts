@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd Unfollower — Popup + Exceptions + Unfollowed Guard
 // @namespace    nigel/letterboxd/unfollower
-// @version      1.3.1
+// @version      1.4.0
 // @description  Find users who don't follow back, unfollow them via hidden iframes, manage exceptions & unfollowed lists, and block re-following unfollowed users. Header button toggles popup, state syncs across tabs.
 // @author       you
 // @match        https://letterboxd.com/*
@@ -23,6 +23,7 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const $ = (sel, root = document) => root.querySelector(sel);
   const $all = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const norm = (u) => (u || '').replace(/^\/|\/$/g, '').trim().toLowerCase();
 
   function getLoggedInUser() {
     try { if (uW.person && uW.person.username) return uW.person.username; } catch (e) {}
@@ -44,8 +45,11 @@
     uiOpen: `lbxd_ui_open_${loggedIn}`,
   };
 
-  // Storage helpers
-  function loadSet(key) { const arr = GM_getValue(key, []); return new Set(Array.isArray(arr) ? arr : []); }
+  // Storage helpers (store everything lowercased for reliable matching)
+  function loadSet(key) {
+    const arr = GM_getValue(key, []);
+    return new Set((Array.isArray(arr) ? arr : []).map(norm));
+  }
   function updateSet(key, mutator) {
     const fresh = loadSet(key);
     mutator(fresh);
@@ -61,20 +65,16 @@
   const saveOpts = () => GM_setValue(KEY.opts, opts);
 
   // Cross-tab sync for sets and popup open/closed
-  let refreshBadges = null;
-
   GM_addValueChangeListener(KEY.exceptions, (_n, _o, v, remote) => {
     if (!remote) return;
-    exceptions.clear();
-    (v || []).forEach((x) => exceptions.add(x));
-    if (refreshBadges) refreshBadges();
+    exceptions.clear(); (v || []).map(norm).forEach((x) => exceptions.add(x));
+    refreshBadges && refreshBadges();
   });
   GM_addValueChangeListener(KEY.unfollowed, (_n, _o, v, remote) => {
     if (!remote) return;
-    unfollowed.clear();
-    (v || []).forEach((x) => unfollowed.add(x));
-    if (refreshBadges) refreshBadges();
-    guardApply();
+    unfollowed.clear(); (v || []).map(norm).forEach((x) => unfollowed.add(x));
+    refreshBadges && refreshBadges();
+    guardApplyAll();
   });
   GM_addValueChangeListener(KEY.uiOpen, (_n, _o, v, remote) => {
     if (!remote) return;
@@ -83,16 +83,20 @@
 
   // --------------- Page helpers ---------------
   function getPageOwner() {
-    const owner = document.body.getAttribute('data-owner');
-    if (owner) return owner.replace(/\/+$/, '');
+    const ownerAttr = document.body.getAttribute('data-owner');
+    if (ownerAttr) return norm(ownerAttr);
     const m = location.pathname.match(/^\/([^/]+)\/?/);
-    if (m && m[1] && !['films','lists','members','journal','search','activity','settings','sign-in','create-account'].includes(m[1])) return m[1];
+    if (m && m[1] && !['films','lists','members','journal','search','activity','settings','sign-in','create-account'].includes(m[1])) {
+      return norm(m[1]);
+    }
     return null;
   }
+
   function extractNamesFromHTML(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    return $all('a.name', doc).map(a => (a.getAttribute('href') || '').replace(/^\/|\/$/g, '')).filter(Boolean);
+    return $all('a.name', doc).map(a => norm(a.getAttribute('href') || '')).filter(Boolean);
   }
+
   async function fetchPage(url) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), opts.scanTimeoutMs);
@@ -102,6 +106,7 @@
       return await res.text();
     } finally { clearTimeout(t); }
   }
+
   async function paginateUserList(user, kind) {
     let page = 1; const out = new Set();
     while (true) {
@@ -113,6 +118,7 @@
     }
     return Array.from(out).sort();
   }
+
   function partitionDontFollowBack(followers, following) {
     const fset = new Set(followers), Fset = new Set(following);
     return {
@@ -129,14 +135,16 @@
     document.body.appendChild(iframe);
     return iframe;
   }
+
   async function clickUnfollowInFrame(iframe) {
     await new Promise((res, rej) => { iframe.addEventListener('load', res, { once: true }); iframe.addEventListener('error', rej, { once: true }); });
     const doc = iframe.contentDocument;
     if (!doc) throw new Error('no doc');
-    const btn = doc.querySelector('a.js-button-following, button.js-button-following, [data-action="unfollow"]');
-    if (btn) { btn.click(); await sleep(opts.clickDelayMs); return !!doc.querySelector('a.js-button-follow, button.js-button-follow, [data-action="follow"]'); }
+    const btn = doc.querySelector('a.js-button-following');
+    if (btn) { btn.click(); await sleep(opts.clickDelayMs); return !!doc.querySelector('a.js-button-follow'); }
     return true;
   }
+
   async function unfollowUsers(usernames, onProgress) {
     const queue = usernames.slice(); let ok = 0, fail = 0;
     const workers = Math.max(1, Math.min(opts.concurrency, 6));
@@ -147,7 +155,7 @@
           iframe = createHiddenIframe(`https://letterboxd.com/${u}/`);
           const success = await clickUnfollowInFrame(iframe);
           if (success) {
-            const updated = updateSet(KEY.unfollowed, s => s.add(u));
+            const updated = updateSet(KEY.unfollowed, s => s.add(norm(u)));
             unfollowed.clear(); updated.forEach(x => unfollowed.add(x));
             ok++;
           } else fail++;
@@ -163,9 +171,9 @@
     return { ok, fail };
   }
 
-  // --------------- Follow guard (robust) ---------------
+  // --------------- Follow guard (global & robust) ---------------
   function markAndDisable(btn) {
-    if (!btn) return;
+    if (!btn || btn.getAttribute('data-lbxd-blocked') === '1') return;
     btn.setAttribute('data-lbxd-blocked', '1');
     btn.style.background = '#D22';
     btn.style.borderColor = '#B11';
@@ -173,93 +181,109 @@
     btn.style.filter = 'saturate(140%)';
     btn.style.opacity = '0.85';
     btn.title = 'Blocked: in your Unfollowed list';
-    if (btn.textContent.trim().toLowerCase().includes('follow')) btn.textContent = 'Blocked';
+    if (btn.textContent && btn.textContent.trim().toLowerCase().includes('follow')) btn.textContent = 'Blocked';
   }
-  function isFollowButton(node) {
-    if (!node) return null;
-    let el = node;
-    for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
-      if (el.matches && (el.matches('a.js-button-follow') || el.matches('a.js-button-following') || el.matches('a[href$="/follow/"]') || el.matches('button.js-button-follow'))) return el;
+  function unmark(btn) {
+    if (!btn) return;
+    btn.removeAttribute('data-lbxd-blocked');
+    btn.style.background = '';
+    btn.style.borderColor = '';
+    btn.style.pointerEvents = '';
+    btn.style.filter = '';
+    btn.style.opacity = '';
+    if (btn.title && btn.title.includes('Blocked')) btn.title = '';
+    // leave label alone if site will re-render it; otherwise it's fine
+  }
+
+  function isAnyFollowBtn(el) {
+    if (!el) return null;
+    let n = el;
+    for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
+      if (!n.matches) continue;
+      if (n.matches('a.js-button-follow, a[data-action$="/follow/"]')) return n;
     }
     return null;
   }
-  function guardApply() {
+
+  // Apply guard to: (1) the page owner’s primary follow button (profile)
+  // and (2) every list/table follow button with a username wrapper.
+  function guardApplyAll() {
     if (!opts.disableFollowOnUnfollowed) return;
+
+    // (1) Page owner
     const owner = getPageOwner();
-    if (!owner || !unfollowed.has(owner)) return;
-    const btn = document.querySelector('a.js-button-follow, a[href$="/follow/"], button.js-button-follow');
-    if (btn) markAndDisable(btn);
+    if (owner && unfollowed.has(owner)) {
+      const btn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
+      if (btn) markAndDisable(btn);
+    }
+
+    // (2) Any list row / grid card with follow wrapper
+    $all('.js-follow-button-wrapper[data-username]').forEach(wrap => {
+      const user = norm(wrap.getAttribute('data-username'));
+      if (!user) return;
+      const followA = wrap.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
+      if (!followA) return;
+      if (unfollowed.has(user)) markAndDisable(followA); else unmark(followA);
+    });
   }
+
+  // Capture-level blocker: prevents follow action anywhere on the page
   document.addEventListener('click', (e) => {
     if (!opts.disableFollowOnUnfollowed) return;
-    const owner = getPageOwner();
-    if (!owner || !unfollowed.has(owner)) return;
-    const followBtn = isFollowButton(e.target);
-    if (followBtn) {
+    const btn = isAnyFollowBtn(e.target);
+    if (!btn) return;
+
+    // Check wrapper username first (lists), then page owner (profile)
+    const wrap = btn.closest('.js-follow-button-wrapper[data-username]');
+    const user = wrap ? norm(wrap.getAttribute('data-username')) : getPageOwner();
+
+    if (user && unfollowed.has(user)) {
       e.preventDefault(); e.stopPropagation();
-      markAndDisable(followBtn);
+      markAndDisable(btn);
     }
   }, true);
-  const mo = new MutationObserver(() => guardApply());
+
+  // Mutation observer to catch dynamically added lists / buttons
+  const mo = new MutationObserver(() => guardApplyAll());
   mo.observe(document.documentElement, { childList: true, subtree: true });
-  guardApply();
+  // Initial guard
+  guardApplyAll();
 
-  // --------------- Header toggle button (placed before "+ LOG") ---------------
-  GM_addStyle(`
-    #lbxd-toggle-btn.button.-secondary{padding:6px 10px;line-height:1.1}
-  `);
-
+  // --------------- Header toggle button ---------------
   function injectHeaderButton() {
-    if (document.getElementById('lbxd-toggle-btn')) return;
-
-    const header = document.getElementById('header');
+    if ($('#lbxd-toggle-btn')) return;
+    const header = $('#header');
     if (!header) return;
-
-    // Try to find the green +LOG cluster or its wrapper
-    const logWrap =
+    const host =
       header.querySelector('.add-menu-wrapper') ||
-      header.querySelector('.js-add-new') ||
-      header.querySelector('a.button.-action');
-
-    const rightCluster = (logWrap && logWrap.parentElement) ||
       header.querySelector('.show-when-logged-in') ||
       header;
-
-    const btn = document.createElement('a');
-    btn.id = 'lbxd-toggle-btn';
-    btn.className = 'button -secondary';
-    btn.textContent = 'Unfollower';
-    btn.href = 'javascript:void(0)';
-
-    btn.addEventListener('click', (e) => {
-      e.preventDefault();
+    const a = document.createElement('a');
+    a.id = 'lbxd-toggle-btn';
+    a.className = 'button -action';
+    a.style.marginLeft = '8px';
+    a.textContent = 'Unfollower';
+    a.href = 'javascript:void(0)';
+    a.addEventListener('click', () => {
       const now = !!GM_getValue(KEY.uiOpen, false);
       GM_setValue(KEY.uiOpen, !now);
       (!now) ? ensurePopup() : destroyPopup();
     });
-
-    if (logWrap && logWrap.parentElement) {
-      btn.style.marginRight = '8px';
-      logWrap.parentElement.insertBefore(btn, logWrap); // place BEFORE +LOG
-    } else {
-      btn.style.marginLeft = '8px';
-      rightCluster.appendChild(btn);
-    }
+    host.appendChild(a);
   }
   injectHeaderButton();
-  const headerBtnObserver = new MutationObserver(() => injectHeaderButton());
-  headerBtnObserver.observe(document.documentElement, { childList: true, subtree: true });
 
   // --------------- Popup (created on demand) ---------------
   let el = null;
   let lastScan = null;
+  let refreshBadges = null;
 
   function ensurePopup() { if (!el) buildPopup(); }
   function destroyPopup() { if (el && el.parentNode) el.remove(); el = null; }
 
   // Styles
   GM_addStyle(`
-    .lbxd-mini{position:fixed;right:16px;bottom:16px;width:340px;background:rgba(20,24,28,.98);color:#E6EDF3;border:1px solid #2a2f35;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-family:ui-sans-serif,system-ui,sans-serif;z-index:999999999}
+    .lbxd-mini{position:fixed;right:16px;bottom:16px;width:360px;background:rgba(20,24,28,.98);color:#E6EDF3;border:1px solid #2a2f35;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-family:ui-sans-serif,system-ui,sans-serif;z-index:999999999}
     .lbxd-mini header{display:flex;justify-content:space-between;padding:10px;font-weight:600;cursor:move;background:#14181C;border-bottom:1px solid #2a2f35;border-radius:12px 12px 0 0}
     .lbxd-mini .btn{padding:6px 10px;font-size:13px;border:1px solid #384049;border-radius:6px;background:#1b2228;color:#E6EDF3;cursor:pointer}
     .lbxd-mini .btn.-primary{background:#1f6feb;border-color:#1a5ec7;color:#fff}
@@ -274,7 +298,7 @@
     .lbxd-mini .bar{height:100%;width:0;background:#1f6feb;transition:width .2s}
     /* modal editor */
     .lbxd-ex-editor{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000000000;display:flex;align-items:center;justify-content:center}
-    .lbxd-ex-editor .box{width:460px;max-width:95vw;background:#14181C;border:1px solid #2a2f35;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+    .lbxd-ex-editor .box{width:480px;max-width:95vw;background:#14181C;border:1px solid #2a2f35;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
     .lbxd-ex-editor header{padding:10px 12px;font-weight:600;border-bottom:1px solid #2a2f35}
     .lbxd-ex-editor .content{padding:10px 12px}
     .lbxd-ex-editor textarea{width:100%;height:240px;background:#0f1418;color:#e6edf3;border:1px solid #2a2f35;border-radius:8px;padding:8px;font-size:12px}
@@ -297,11 +321,15 @@
         </div>
         <div class="row">
           <button class="btn -primary scanBtn">Scan</button>
+        </div>
+        <div class="row">
           <button class="btn addExBtn">+ Exception</button>
+          <button class="btn remExBtn">− Remove Exception (this user)</button>
           <button class="btn editExBtn">Edit Exceptions</button>
         </div>
         <div class="row">
           <button class="btn addUfBtn">+ Add Unfollowed (this user)</button>
+          <button class="btn remUfBtn">− Remove Unfollowed (this user)</button>
           <button class="btn editUfBtn">Edit Unfollowed</button>
         </div>
         <div class="row">
@@ -329,8 +357,8 @@
 
     // refs
     const closeBtn = el.querySelector('.x'), scanBtn = el.querySelector('.scanBtn'),
-      addExBtn = el.querySelector('.addExBtn'), editExBtn = el.querySelector('.editExBtn'),
-      addUfBtn = el.querySelector('.addUfBtn'), editUfBtn = el.querySelector('.editUfBtn'),
+      addExBtn = el.querySelector('.addExBtn'), remExBtn = el.querySelector('.remExBtn'), editExBtn = el.querySelector('.editExBtn'),
+      addUfBtn = el.querySelector('.addUfBtn'), remUfBtn = el.querySelector('.remUfBtn'), editUfBtn = el.querySelector('.editUfBtn'),
       unfollowBtn = el.querySelector('.unfollowBtn'), exportBtn = el.querySelector('.exportBtn'),
       importBtn = el.querySelector('.importBtn'), clearBtn = el.querySelector('.clearBtn'),
       guardChk = el.querySelector('.guardChk'), logArea = el.querySelector('.log'),
@@ -345,17 +373,47 @@
 
     // events
     closeBtn.onclick = () => { GM_setValue(KEY.uiOpen, false); destroyPopup(); };
-    guardChk.onchange = () => { opts.disableFollowOnUnfollowed = guardChk.checked; saveOpts(); guardApply(); };
+    guardChk.onchange = () => { opts.disableFollowOnUnfollowed = guardChk.checked; saveOpts(); guardApplyAll(); };
 
+    // Exceptions
     addExBtn.onclick = () => {
       const owner = getPageOwner(); if (!owner) { log('No user detected.'); return; }
-      if (owner.toLowerCase() === loggedIn.toLowerCase()) { log('That’s you.'); return; }
+      if (owner === norm(loggedIn)) { log('That’s you.'); return; }
       const updated = updateSet(KEY.exceptions, s => s.add(owner));
       exceptions.clear(); updated.forEach(x => exceptions.add(x));
       refreshBadges(); log(`Added exception: ${owner}`);
     };
+    remExBtn.onclick = () => {
+      const owner = getPageOwner(); if (!owner) { log('No user detected.'); return; }
+      if (!exceptions.has(owner)) { log(`Not in exceptions: ${owner}`); return; }
+      const updated = updateSet(KEY.exceptions, s => s.delete(owner));
+      exceptions.clear(); updated.forEach(x => exceptions.add(x));
+      refreshBadges(); log(`Removed exception: ${owner}`);
+    };
 
-    // Multi-line editors
+    // Unfollowed
+    addUfBtn.onclick = () => {
+      const owner = getPageOwner(); if (!owner) { log('No user detected.'); return; }
+      const updated = updateSet(KEY.unfollowed, s => s.add(owner));
+      unfollowed.clear(); updated.forEach(x => unfollowed.add(x));
+      refreshBadges(); log(`Added to Unfollowed: ${owner}`);
+      guardApplyAll();
+    };
+    remUfBtn.onclick = () => {
+      const owner = getPageOwner(); if (!owner) { log('No user detected.'); return; }
+      if (!unfollowed.has(owner)) { log(`Not in Unfollowed: ${owner}`); return; }
+      const updated = updateSet(KEY.unfollowed, s => s.delete(owner));
+      unfollowed.clear(); updated.forEach(x => unfollowed.add(x));
+      refreshBadges(); log(`Removed from Unfollowed: ${owner}`);
+      // Unmark any follow buttons for this user now visible
+      $all('.js-follow-button-wrapper[data-username]').forEach(w => {
+        if (norm(w.getAttribute('data-username')) === owner) unmark(w.querySelector('a.js-button-follow, a[data-action$="/follow/"]'));
+      });
+      const pageBtn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
+      if (pageBtn) unmark(pageBtn);
+    };
+
+    // Editors
     function openListEditor(kind, title) {
       document.querySelector('.lbxd-ex-editor')?.remove();
       const overlay = document.createElement('div');
@@ -378,31 +436,22 @@
       ta.value = Array.from(source).sort().join('\n');
       $('.cancelBtn', overlay).onclick = () => overlay.remove();
       $('.saveBtn', overlay).onclick = () => {
-        const next = new Set(ta.value.split('\n').map(s => s.trim()).filter(Boolean));
+        const next = new Set(ta.value.split('\n').map(s => norm(s)).filter(Boolean));
         const k = (kind === 'exceptions') ? KEY.exceptions : KEY.unfollowed;
         const updated = updateSet(k, s => { s.clear(); next.forEach(x => s.add(x)); });
         const target = (kind === 'exceptions') ? exceptions : unfollowed;
         target.clear(); updated.forEach(x => target.add(x));
         refreshBadges(); log(`${title} saved.`);
         overlay.remove();
-        if (kind === 'unfollowed') guardApply();
+        if (kind === 'unfollowed') guardApplyAll();
       };
       overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
       ta.focus();
     }
-
     editExBtn.onclick = () => openListEditor('exceptions', 'Edit Exceptions');
     editUfBtn.onclick = () => openListEditor('unfollowed', 'Edit Unfollowed');
 
-    addUfBtn.onclick = () => {
-      const owner = getPageOwner(); if (!owner) { log('No user detected.'); return; }
-      const updated = updateSet(KEY.unfollowed, s => s.add(owner));
-      unfollowed.clear(); updated.forEach(x => unfollowed.add(x));
-      refreshBadges(); log(`Added to Unfollowed: ${owner}`);
-      guardApply();
-    };
-
-    clearBtn.onclick = () => { updateSet(KEY.unfollowed, s => s.clear()); unfollowed.clear(); refreshBadges(); log('Cleared unfollowed list.'); guardApply(); };
+    clearBtn.onclick = () => { updateSet(KEY.unfollowed, s => s.clear()); unfollowed.clear(); refreshBadges(); log('Cleared unfollowed list.'); guardApplyAll(); };
 
     exportBtn.onclick = () => {
       const payload = { account: loggedIn, when: new Date().toISOString(), options: opts, exceptions: Array.from(exceptions), unfollowed: Array.from(unfollowed) };
@@ -412,13 +461,13 @@
       const text = prompt('Paste JSON:'); if (!text) return;
       try {
         const data = JSON.parse(text);
-        if (Array.isArray(data.exceptions)) updateSet(KEY.exceptions, s => { s.clear(); data.exceptions.forEach(x => s.add(x)); });
-        if (Array.isArray(data.unfollowed)) updateSet(KEY.unfollowed, s => { s.clear(); data.unfollowed.forEach(x => s.add(x)); });
+        if (Array.isArray(data.exceptions)) updateSet(KEY.exceptions, s => { s.clear(); data.exceptions.map(norm).forEach(x => s.add(x)); });
+        if (Array.isArray(data.unfollowed)) updateSet(KEY.unfollowed, s => { s.clear(); data.unfollowed.map(norm).forEach(x => s.add(x)); });
         if (data.options) Object.assign(opts, data.options), saveOpts();
         exceptions.clear(); loadSet(KEY.exceptions).forEach(x => exceptions.add(x));
         unfollowed.clear(); loadSet(KEY.unfollowed).forEach(x => unfollowed.add(x));
         refreshBadges(); log('Import complete.');
-        guardApply();
+        guardApplyAll();
       } catch { alert('Invalid JSON.'); }
     };
 
@@ -428,8 +477,8 @@
         log('Scanning...');
         setProgress(0, 0);
         const [followers, following] = await Promise.all([
-          paginateUserList(loggedIn, 'followers'),
-          paginateUserList(loggedIn, 'following'),
+          paginateUserList(norm(loggedIn), 'followers'),
+          paginateUserList(norm(loggedIn), 'following'),
         ]);
         const { dontFollowBack } = partitionDontFollowBack(followers, following);
         const filtered = dontFollowBack.filter(u => !exceptions.has(u));
@@ -448,6 +497,7 @@
       const res = await unfollowUsers(lastScan.filtered, p => { setProgress(p.done, p.total); if (p.current) log(`Processed ${p.current}`); });
       log(`Done. Success ${res.ok}, Fail ${res.fail}`);
       refreshBadges(); unfollowBtn.disabled = scanBtn.disabled = false;
+      guardApplyAll();
     };
   }
 
