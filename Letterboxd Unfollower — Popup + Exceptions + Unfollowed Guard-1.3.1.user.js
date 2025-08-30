@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Letterboxd Unfollower — Popup + Exceptions + Unfollowed Guard
 // @namespace    nigel/letterboxd/unfollower
-// @version      1.4.0
+// @version      1.4.2
 // @description  Find users who don't follow back, unfollow them via hidden iframes, manage exceptions & unfollowed lists, and block re-following unfollowed users. Header button toggles popup, state syncs across tabs.
 // @author       you
 // @match        https://letterboxd.com/*
@@ -60,11 +60,13 @@
   const exceptions = loadSet(KEY.exceptions);
   const unfollowed = loadSet(KEY.unfollowed);
 
-  const defaultOpts = { disableFollowOnUnfollowed: true, concurrency: 3, scanTimeoutMs: 8000, clickDelayMs: 350 };
+  // NOTE: bump default scan timeout a bit to reduce false aborts
+  const defaultOpts = { disableFollowOnUnfollowed: true, concurrency: 3, scanTimeoutMs: 12000, clickDelayMs: 350 };
   const opts = Object.assign(defaultOpts, GM_getValue(KEY.opts, {}));
   const saveOpts = () => GM_setValue(KEY.opts, opts);
 
-  // Cross-tab sync for sets and popup open/closed
+  // Cross-tab sync
+  let refreshBadges = null;
   GM_addValueChangeListener(KEY.exceptions, (_n, _o, v, remote) => {
     if (!remote) return;
     exceptions.clear(); (v || []).map(norm).forEach((x) => exceptions.add(x));
@@ -92,9 +94,25 @@
     return null;
   }
 
+  // Robust username extraction for followers/following tables
   function extractNamesFromHTML(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    return $all('a.name', doc).map(a => norm(a.getAttribute('href') || '')).filter(Boolean);
+    const out = new Set();
+
+    // 1) Standard username anchor in tables
+    $all('a.name', doc).forEach(a => {
+      const href = a.getAttribute('href') || '';
+      const slug = norm(href);
+      if (slug) out.add(slug);
+    });
+
+    // 2) Fallback: server-rendered follow-button wrappers carry data-username
+    $all('.js-follow-button-wrapper[data-username]', doc).forEach(w => {
+      const u = norm(w.getAttribute('data-username'));
+      if (u) out.add(u);
+    });
+
+    return Array.from(out);
   }
 
   async function fetchPage(url) {
@@ -107,10 +125,20 @@
     } finally { clearTimeout(t); }
   }
 
+  // Retry wrapper to dodge transient network hiccups / slow pages
+  async function fetchPageWithRetry(url, tries = 3) {
+    let lastErr;
+    for (let i = 0; i < tries; i++) {
+      try { return await fetchPage(url); }
+      catch (e) { lastErr = e; await sleep(400 * (i + 1)); }
+    }
+    throw lastErr || new Error('fetch failed');
+  }
+
   async function paginateUserList(user, kind) {
     let page = 1; const out = new Set();
     while (true) {
-      const html = await fetchPage(`https://letterboxd.com/${user}/${kind}/page/${page}`);
+      const html = await fetchPageWithRetry(`https://letterboxd.com/${user}/${kind}/page/${page}`);
       const names = extractNamesFromHTML(html);
       if (!names.length) break;
       names.forEach(n => out.add(n));
@@ -140,8 +168,8 @@
     await new Promise((res, rej) => { iframe.addEventListener('load', res, { once: true }); iframe.addEventListener('error', rej, { once: true }); });
     const doc = iframe.contentDocument;
     if (!doc) throw new Error('no doc');
-    const btn = doc.querySelector('a.js-button-following');
-    if (btn) { btn.click(); await sleep(opts.clickDelayMs); return !!doc.querySelector('a.js-button-follow'); }
+    const btn = doc.querySelector('a.js-button-following, button.js-button-following, [data-action$="/unfollow/"]');
+    if (btn) { btn.click(); await sleep(opts.clickDelayMs); return !!doc.querySelector('a.js-button-follow, button.js-button-follow, [data-action$="/follow/"]'); }
     return true;
   }
 
@@ -192,7 +220,6 @@
     btn.style.filter = '';
     btn.style.opacity = '';
     if (btn.title && btn.title.includes('Blocked')) btn.title = '';
-    // leave label alone if site will re-render it; otherwise it's fine
   }
 
   function isAnyFollowBtn(el) {
@@ -200,28 +227,26 @@
     let n = el;
     for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
       if (!n.matches) continue;
-      if (n.matches('a.js-button-follow, a[data-action$="/follow/"]')) return n;
+      if (n.matches('a.js-button-follow, a[data-action$="/follow/"], button.js-button-follow')) return n;
     }
     return null;
   }
 
-  // Apply guard to: (1) the page owner’s primary follow button (profile)
-  // and (2) every list/table follow button with a username wrapper.
+  // Apply guard to page owner + any list/table rows visible
   function guardApplyAll() {
     if (!opts.disableFollowOnUnfollowed) return;
 
-    // (1) Page owner
+    // Page owner follow button
     const owner = getPageOwner();
     if (owner && unfollowed.has(owner)) {
-      const btn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
+      const btn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"], button.js-button-follow');
       if (btn) markAndDisable(btn);
     }
 
-    // (2) Any list row / grid card with follow wrapper
+    // Any rows/cards with a username wrapper
     $all('.js-follow-button-wrapper[data-username]').forEach(wrap => {
       const user = norm(wrap.getAttribute('data-username'));
-      if (!user) return;
-      const followA = wrap.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
+      const followA = wrap.querySelector('a.js-button-follow, a[data-action$="/follow/"], button.js-button-follow');
       if (!followA) return;
       if (unfollowed.has(user)) markAndDisable(followA); else unmark(followA);
     });
@@ -233,7 +258,6 @@
     const btn = isAnyFollowBtn(e.target);
     if (!btn) return;
 
-    // Check wrapper username first (lists), then page owner (profile)
     const wrap = btn.closest('.js-follow-button-wrapper[data-username]');
     const user = wrap ? norm(wrap.getAttribute('data-username')) : getPageOwner();
 
@@ -246,37 +270,52 @@
   // Mutation observer to catch dynamically added lists / buttons
   const mo = new MutationObserver(() => guardApplyAll());
   mo.observe(document.documentElement, { childList: true, subtree: true });
-  // Initial guard
   guardApplyAll();
 
   // --------------- Header toggle button ---------------
+  GM_addStyle(`#lbxd-toggle-btn.button.-secondary{padding:6px 10px;line-height:1.1}`);
   function injectHeaderButton() {
-    if ($('#lbxd-toggle-btn')) return;
-    const header = $('#header');
+    if (document.getElementById('lbxd-toggle-btn')) return;
+
+    const header = document.getElementById('header');
     if (!header) return;
-    const host =
+
+    const logWrap =
       header.querySelector('.add-menu-wrapper') ||
+      header.querySelector('.js-add-new') ||
+      header.querySelector('a.button.-action');
+
+    const rightCluster = (logWrap && logWrap.parentElement) ||
       header.querySelector('.show-when-logged-in') ||
       header;
-    const a = document.createElement('a');
-    a.id = 'lbxd-toggle-btn';
-    a.className = 'button -action';
-    a.style.marginLeft = '8px';
-    a.textContent = 'Unfollower';
-    a.href = 'javascript:void(0)';
-    a.addEventListener('click', () => {
+
+    const btn = document.createElement('a');
+    btn.id = 'lbxd-toggle-btn';
+    btn.className = 'button -secondary';
+    btn.textContent = 'Unfollower';
+    btn.href = 'javascript:void(0)';
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
       const now = !!GM_getValue(KEY.uiOpen, false);
       GM_setValue(KEY.uiOpen, !now);
       (!now) ? ensurePopup() : destroyPopup();
     });
-    host.appendChild(a);
+
+    if (logWrap && logWrap.parentElement) {
+      btn.style.marginRight = '8px';
+      logWrap.parentElement.insertBefore(btn, logWrap); // before +LOG
+    } else {
+      btn.style.marginLeft = '8px';
+      rightCluster.appendChild(btn);
+    }
   }
   injectHeaderButton();
+  const headerBtnObserver = new MutationObserver(() => injectHeaderButton());
+  headerBtnObserver.observe(document.documentElement, { childList: true, subtree: true });
 
   // --------------- Popup (created on demand) ---------------
   let el = null;
   let lastScan = null;
-  let refreshBadges = null;
 
   function ensurePopup() { if (!el) buildPopup(); }
   function destroyPopup() { if (el && el.parentNode) el.remove(); el = null; }
@@ -405,12 +444,12 @@
       const updated = updateSet(KEY.unfollowed, s => s.delete(owner));
       unfollowed.clear(); updated.forEach(x => unfollowed.add(x));
       refreshBadges(); log(`Removed from Unfollowed: ${owner}`);
-      // Unmark any follow buttons for this user now visible
+      // Unmark any visible buttons for this user
       $all('.js-follow-button-wrapper[data-username]').forEach(w => {
-        if (norm(w.getAttribute('data-username')) === owner) unmark(w.querySelector('a.js-button-follow, a[data-action$="/follow/"]'));
+        if (norm(w.getAttribute('data-username')) === owner) unmark(w.querySelector('a.js-button-follow, a[data-action$="/follow/"], button.js-button-follow'));
       });
-      const pageBtn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"]');
-      if (pageBtn) unmark(pageBtn);
+      const pageBtn = document.querySelector('a.js-button-follow, a[data-action$="/follow/"], button.js-button-follow');
+      if (pageBtn && getPageOwner() === owner) unmark(pageBtn);
     };
 
     // Editors
@@ -487,7 +526,11 @@
         log(`Don't follow back: ${dontFollowBack.length}, After exceptions: ${filtered.length}`);
         setProgress(0, filtered.length);
         unfollowBtn.disabled = filtered.length === 0;
-      } catch { log('Scan failed.'); } finally { scanBtn.disabled = false; }
+      } catch (e) {
+        log(`Scan failed: ${e && e.message ? e.message : e}`);
+      } finally {
+        scanBtn.disabled = false;
+      }
     };
 
     unfollowBtn.onclick = async () => {
